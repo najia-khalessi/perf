@@ -85,23 +85,10 @@ struct elf_file* find_or_create_elf(struct system_context* sys, int pid, const c
         return NULL; // 忽略匿名内存区域或无效名称
     }
 
-    char host_path[PATH_MAX];
-    snprintf(host_path, sizeof(host_path), "/proc/%d/root/%s", pid, filename);
-
-    // 修正：移除多余的斜杠，如果filename已经是绝对路径
-    if (filename[0] == '/') {
-        snprintf(host_path, sizeof(host_path), "/proc/%d/root%s", pid, filename);
-    } else {
-        // 这是针对非绝对路径（如vdso）的修正
-        snprintf(host_path, sizeof(host_path), "/proc/%d/root/%s", pid, filename);
-    }
-
     int fd = -1;
-    Elf* e = elf_parser_init(host_path, &fd);
+    Elf* e = elf_parser_init(filename, &fd);
     if (!e) {
-        // 对于宿主进程或/proc/<pid>/root不可访问的情况，回退到原始路径
-        e = elf_parser_init(filename, &fd);
-        if (!e) return NULL;
+        return NULL;
     }
 
     char* build_id = get_elf_build_id_from_elf(e);
