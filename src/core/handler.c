@@ -23,15 +23,21 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include <time.h>
 
 #include "../../include/header.h"
 #include "../../include/config.h"
+#include "../../include/database.h"
+#include "../../include/buffer.h"
+#include "../../include/elf_utils.h"
 
 // PERF_CONTEXT_MAX 是有效IP地址的上限。
 // 超过此值的地址是上下文标记。此值来自内核UAPI
 #ifndef PERF_CONTEXT_MAX
 #define PERF_CONTEXT_MAX ((__u64)-4095)
 #endif
+
+// 已移除live模式相关文件输出逻辑，采样仅在collect模式缓存原始调用栈
 
 /**
  * @brief 解析来自perf_event_header的原始采样数据。
@@ -77,6 +83,11 @@ void parse_sample_data(struct perf_event_header *header, struct callchain_result
         uint64_t nr = (nr_from_data < nr_from_size) ? nr_from_data : nr_from_size;
         uint64_t count_to_copy = (nr < max_ips) ? nr : max_ips;
 
+        if (global_config.verbose) {
+            fprintf(stderr, "[DEBUG] LBR Mode: nr_from_data=%llu, nr_from_size=%llu, nr=%llu, max_ips=%llu, count_to_copy=%llu\n",
+                    (unsigned long long)nr_from_data, (unsigned long long)nr_from_size, (unsigned long long)nr, (unsigned long long)max_ips, (unsigned long long)count_to_copy);
+        }
+
         result->nr = 0;
         struct perf_branch_entry *branches = (struct perf_branch_entry *)ptr;
         for (uint64_t i = 0; i < count_to_copy; i++) {
@@ -84,6 +95,9 @@ void parse_sample_data(struct perf_event_header *header, struct callchain_result
             if (branches[i].from) {
                 result->ips[result->nr++] = branches[i].from;
             }
+        }
+        if (global_config.verbose) {
+            fprintf(stderr, "[DEBUG] LBR Mode: Final result->nr=%llu\n", (unsigned long long)result->nr);
         }
     } else {
         // 软件模式: 安全地解析调用栈
@@ -99,9 +113,17 @@ void parse_sample_data(struct perf_event_header *header, struct callchain_result
         uint64_t nr = (nr_from_data < nr_from_size) ? nr_from_data : nr_from_size;
         uint64_t count_to_copy = (nr < max_ips) ? nr : max_ips;
         
+        if (global_config.verbose) {
+            fprintf(stderr, "[DEBUG] Software Mode: nr_from_data=%llu, nr_from_size=%llu, nr=%llu, max_ips=%llu, count_to_copy=%llu\n",
+                    (unsigned long long)nr_from_data, (unsigned long long)nr_from_size, (unsigned long long)nr, (unsigned long long)max_ips, (unsigned long long)count_to_copy);
+        }
+
         result->nr = count_to_copy;
         if (count_to_copy > 0) {
             memcpy(result->ips, ptr, count_to_copy * sizeof(uint64_t));
+        }
+        if (global_config.verbose) {
+            fprintf(stderr, "[DEBUG] Software Mode: Final result->nr=%llu\n", (unsigned long long)result->nr);
         }
     }
 }
@@ -114,123 +136,212 @@ void parse_sample_data(struct perf_event_header *header, struct callchain_result
  * 此函数遍历调用链中的每个地址，将其解析为符号（函数名），
  * 并打印符号化的栈回溯。
  */
-void symbolize_sample(struct system_context *sys, struct callchain_result *callchain) {
-    extern struct profiling_config global_config;
-    
-    // 将主IP和调用链IP合并到一个列表中进行处理。
-    uint64_t all_ips[callchain->nr + 2]; // +1 for IP, +1 for safety
-    int valid_ips_count = 0;
+// 辅助函数：符号化调用链并格式化为字符串
+static char* symbolize_and_format_callstack(struct system_context *sys, struct callchain_result *callchain) {
+    size_t buffer_size = 8192; // 初始大小
+    char* result = malloc(buffer_size);
+    if (!result) return NULL;
 
-    // 首先添加主IP，过滤掉内核标记
-    if (callchain->ip && callchain->ip < PERF_CONTEXT_MAX) {
-        all_ips[valid_ips_count++] = callchain->ip;
+    char* current = result;
+    size_t remaining = buffer_size;
+    *current = '\0';
+
+    for (uint64_t i = 0; i < callchain->nr; i++) {
+        uint64_t addr = callchain->ips[i];
+        if (addr >= PERF_CONTEXT_MAX) continue;
+
+        const char* symbol_str = NULL;
+        char* temp_buffer = NULL;
+        struct symbol_info s_info = {0}; // 在循环的开始处声明并初始化
+
+        if (is_kernel_addr(addr)) {
+            const char* symbol = find_kernel_symbol(sys->kernel_symbols, addr);
+            if (symbol) {
+                size_t len = strlen(symbol) + 10;
+                temp_buffer = malloc(len);
+                snprintf(temp_buffer, len, "%s[内核]", symbol);
+                symbol_str = temp_buffer;
+            } else {
+                temp_buffer = malloc(64);
+                snprintf(temp_buffer, 64, "0x%llx[内核]", (unsigned long long)addr);
+                symbol_str = temp_buffer;
+            }
+        } else {
+            if (find_symbol_for_address(sys, callchain->pid, addr, &s_info) == 0) {
+                symbol_str = s_info.symbol_name;
+            } else {
+                temp_buffer = malloc(64);
+                snprintf(temp_buffer, 64, "0x%llx", (unsigned long long)addr);
+                symbol_str = temp_buffer;
+            }
+        }
+
+        while (true) {
+            int written = snprintf(current, remaining, "%s%s", (i > 0 ? ";" : ""), symbol_str);
+            if (written < 0) {
+                // 编码错误
+                free(result);
+                if (temp_buffer) free(temp_buffer);
+                if (s_info.symbol_name) free(s_info.symbol_name);
+                if (s_info.file_path) free(s_info.file_path);
+                return NULL;
+            }
+
+            if (written < remaining) {
+                // 成功
+                current += written;
+                remaining -= written;
+                break;
+            }
+            
+            // 空间不足，扩容
+            size_t new_size = buffer_size * 2;
+            char* new_buffer = realloc(result, new_size);
+            if (!new_buffer) {
+                free(result);
+                if (temp_buffer) free(temp_buffer);
+                if (s_info.symbol_name) free(s_info.symbol_name);
+                if (s_info.file_path) free(s_info.file_path);
+                return NULL;
+            }
+            current = new_buffer + (current - result);
+            result = new_buffer;
+            remaining = new_size - (current - result);
+            buffer_size = new_size;
+        }
+        
+        if (temp_buffer) {
+            free(temp_buffer);
+        }
+        
+
     }
 
-    // 添加调用链IP，过滤掉内核标记
+    return result;
+}
+
+// 辅助函数：为火焰图格式化调用栈
+static char* format_for_flamegraph(struct system_context *sys, struct callchain_result *callchain) {
+    size_t buffer_size = 4096; // 初始大小
+    char* result = malloc(buffer_size);
+    if (!result) return NULL;
+
+    char* current = result;
+    size_t remaining = buffer_size;
+    *current = '\0';
+
+    // 1. 获取进程名
+    struct process_info* pinfo = find_new_process(sys->process_table, callchain->pid);
+    const char* proc_name = pinfo ? pinfo->process_name : "unknown";
+    
+    int written = snprintf(current, remaining, "%s", proc_name);
+    if (written < 0 || written >= remaining) {
+        free(result);
+        return NULL;
+    }
+    current += written;
+    remaining -= written;
+
+    // 2. 遍历调用栈并符号化
     for (uint64_t i = 0; i < callchain->nr; i++) {
-        if (callchain->ips[i] < PERF_CONTEXT_MAX) {
-            all_ips[valid_ips_count++] = callchain->ips[i];
+        uint64_t addr = callchain->ips[i];
+        if (addr >= PERF_CONTEXT_MAX) continue;
+
+        const char* symbol_str = NULL;
+        char* temp_buffer = NULL;
+        struct symbol_info s_info = {0};
+
+        if (is_kernel_addr(addr)) {
+            const char* symbol = find_kernel_symbol(sys->kernel_symbols, addr);
+            if (symbol) {
+                size_t len = strlen(symbol) + 3; // for ";k"
+                temp_buffer = malloc(len);
+                if(temp_buffer) snprintf(temp_buffer, len, ";%s", symbol);
+            } else {
+                temp_buffer = malloc(64);
+                if(temp_buffer) snprintf(temp_buffer, 64, ";0x%llx", (unsigned long long)addr);
+            }
+            symbol_str = temp_buffer;
+        } else {
+            if (find_symbol_for_address(sys, callchain->pid, addr, &s_info) == 0) {
+                size_t len = strlen(s_info.symbol_name) + 2;
+                temp_buffer = malloc(len);
+                if(temp_buffer) snprintf(temp_buffer, len, ";%s", s_info.symbol_name);
+                symbol_str = temp_buffer;
+                free(s_info.symbol_name); 
+                if (s_info.file_path) free(s_info.file_path);
+            } else {
+                temp_buffer = malloc(64);
+                if(temp_buffer) snprintf(temp_buffer, 64, ";0x%llx", (unsigned long long)addr);
+                symbol_str = temp_buffer;
+            }
+        }
+        
+        if (!symbol_str) {
+            symbol_str = ";unknown_symbol";
+        }
+
+        size_t symbol_len = strlen(symbol_str);
+
+        if (remaining < symbol_len + 1) {
+            size_t new_size = buffer_size * 2;
+            char* new_buffer = realloc(result, new_size);
+            if (!new_buffer) {
+                free(result);
+                if (temp_buffer) free(temp_buffer);
+                return NULL;
+            }
+            current = new_buffer + (current - result);
+            result = new_buffer;
+            remaining = new_size - (current - result);
+            buffer_size = new_size;
+        }
+        
+        memcpy(current, symbol_str, symbol_len);
+        current += symbol_len;
+        remaining -= symbol_len;
+
+        if (temp_buffer) {
+            free(temp_buffer);
         }
     }
+    *current = '\0'; // Ensure null termination
 
-    if (valid_ips_count == 0) {
+    return result;
+}
+
+void symbolize_sample(struct system_context *sys, struct callchain_result *callchain, struct ring_buffer *buffer, const struct profiling_config* config) {
+    // 火焰图模式：直接打印折叠后的调用栈
+    if (config->flamegraph_mode) {
+        if (callchain->nr > 0) {
+            char* formatted_stack = format_for_flamegraph(sys, callchain);
+            if (formatted_stack) {
+                printf("%s 1\n", formatted_stack);
+                free(formatted_stack);
+            }
+        }
         return;
     }
 
-    // 为火焰图格式化准备一个足够大的缓冲区
-    char flame_stack[8192] = {0};
-    char *current_pos = flame_stack;
-    size_t remaining_size = sizeof(flame_stack);
-
-    // 首先获取进程信息，用于火焰图的第一帧
-    struct process_info* proc_info = find_new_process(sys->process_table, callchain->pid);
-    if (proc_info && proc_info->process_name) {
-        int written = snprintf(current_pos, remaining_size, "%s", proc_info->process_name);
-        if (written > 0 && written < remaining_size) {
-            current_pos += written;
-            remaining_size -= written;
-        }
-    } else {
-        // 如果找不到进程名，则使用PID
-        int written = snprintf(current_pos, remaining_size, "pid_%d", callchain->pid);
-        if (written > 0 && written < remaining_size) {
-            current_pos += written;
-            remaining_size -= written;
-        }
-    }
-
-    // 火焰图要求调用栈从父到子，所以我们反向遍历IPs
-    for (int i = valid_ips_count - 1; i >= 0; i--) {
-        uint64_t current_ip = all_ips[i];
-        const char *symbol_name = NULL;
-        
-        bool is_kernel_addr = (current_ip & 0x8000000000000000ULL) != 0;
-
-        // 地址空间过滤
-        switch (global_config.filter_mode) {
-            case FILTER_USER: if (is_kernel_addr) continue; break;
-            case FILTER_KERNEL: if (!is_kernel_addr) continue; break;
-            default: break;
-        }
-
-        if (is_kernel_addr) {
-            symbol_name = find_kernel_symbol(sys->kernel_symbols, current_ip);
-        } else {
-            // 确保我们有最新的进程信息
-            if (!proc_info) {
-                proc_info = find_new_process(sys->process_table, callchain->pid);
-            }
+    // collect 模式：进行符号化并记录
+    if (config->op_mode == MODE_COLLECT) {
+        if (callchain->nr > 0 && buffer) {
+            struct buffer_entry entry;
+            entry.pid = callchain->pid;
+            entry.tid = callchain->tid;
             
-            if (proc_info) {
-                // 通过比较进程启动时间来检测PID复用
-                unsigned long long current_start_time = get_process_start_time(proc_info->process_id);
-                if (proc_info->start_time != current_start_time) {
-                    if (global_config.verbose) {
-                        printf("PID %d recycled. Invalidating cache.\n", proc_info->process_id);
-                    }
-                    remove_process(sys, proc_info->process_id);
-                    proc_info = find_new_process(sys->process_table, callchain->pid);
-                }
-                
-                // 检查VMA树是否有效。如果树为空，说明进程内存映射解析失败（可能进程已退出）
-                if (proc_info && proc_info->memory_map_tree.rb_node) {
-                    struct virtual_memory_area* vma_info = find_vma_from_process(proc_info, current_ip);
-                    
-                    // 检查VMA是否映射到一个我们可以分析的ELF文件。
-                    // 跳过匿名内存、堆、栈以及[vdso]等特殊区域。
-                    if (vma_info && vma_info->mapping_name && vma_info->mapping_name[0] != '\0' && vma_info->mapping_name[0] != '[') {
-                        
-                        // 如果VMA尚未关联ELF文件，则查找或创建它，然后缓存指针
-                        if (!vma_info->elf_file) {
-                            vma_info->elf_file = find_or_create_elf(sys, callchain->pid, vma_info->mapping_name);
-                        }
-                        
-                        if (vma_info->elf_file) {
-                            uint64_t relative_addr = get_relative_address(current_ip, vma_info);
-                            symbol_name = find_symbol_name_from_elf(vma_info->elf_file, relative_addr);
-                        }
-                    }
-                }
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            entry.timestamp = (long long)ts.tv_sec * 1000000000 + ts.tv_nsec;
+
+            entry.stack = symbolize_and_format_callstack(sys, callchain);
+            if (entry.stack) {
+                buffer_push(buffer, &entry);
+                // buffer_push拥有所有权，不需要在这里释放
             }
         }
-
-        if (!symbol_name) {
-            symbol_name = "[unknown]";
-        }
-
-        // 将符号拼接到火焰图堆栈字符串中
-        int written = snprintf(current_pos, remaining_size, ";%s", symbol_name);
-        if (written > 0 && written < remaining_size) {
-            current_pos += written;
-            remaining_size -= written;
-        } else {
-            // 缓冲区不足，停止拼接
-            break;
-        }
+        return;
     }
 
-    // 打印完整的火焰图格式行
-    if (strlen(flame_stack) > 0) {
-        printf("%s 1\n", flame_stack);
-    }
+    // query模式不在采集时进行符号化，离线分析由 src/core/query.c 完成
 }
