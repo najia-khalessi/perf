@@ -28,8 +28,8 @@
 #include <sched.h>
 #include <stdatomic.h>
 
-#include "../include/perf.h"
-#include "../include/config.h"
+#include "../../include/perf.h"
+#include "../../include/config.h"
 
 /**
  * @brief perf_event_open系统调用的封装函数
@@ -94,9 +94,20 @@ static struct perf_event_attr build_perf_attr(const struct profiling_config* con
     pe.sample_max_stack = config->max_stack_depth > 0 ? config->max_stack_depth : 127;
     
     pe.disabled = 1;
-    pe.exclude_kernel = 0;  // 全量采集，包含用户态和内核态
+    // 采集过滤：根据命令行 --filter=all|user|kernel 设置
+    // 默认 FILTER_ALL：同时采集用户态与内核态
+    if (config->filter_mode == FILTER_USER) {
+        pe.exclude_kernel = 1;
+        pe.exclude_user = 0;
+    } else if (config->filter_mode == FILTER_KERNEL) {
+        pe.exclude_kernel = 0;
+        pe.exclude_user = 1;
+    } else { // FILTER_ALL
+        pe.exclude_kernel = 0;
+        pe.exclude_user = 0;
+    }
     pe.exclude_idle = 1;    // 不采集IDLE的CPU
-    
+
     return pe;
 }
 
@@ -212,21 +223,21 @@ struct perf_event_manager* perf_event_init_with_config(const struct profiling_co
 
     struct perf_event_attr pe = build_perf_attr(config);
     
-    // 系统模式：每个CPU一个事件，监控所有进程
+    pid_t target_pid = config->target_pid; // Use target_pid to decide profiling scope
+
     for (int cpu = 0; cpu < num_cpus; cpu++) {
-        int fd = create_perf_event(&pe, cpu, -1);
+        int fd = create_perf_event(&pe, cpu, target_pid);
         if (fd == -1) {
-            fprintf(stderr, "Error opening perf event for CPU %d: %s\n",
-                    cpu, strerror(errno));
+            fprintf(stderr, "Error opening perf event for CPU %d (PID: %d): %s\n",
+                    cpu, target_pid, strerror(errno));
             cleanup_events(manager, cpu);
             return NULL;
         }
 
         manager->events[cpu].fd = fd;
         manager->events[cpu].cpu = cpu;
-        manager->events[cpu].target_pid = -1;
+        manager->events[cpu].target_pid = target_pid;
 
-        // 使用mmap映射perf事件缓冲区
         manager->events[cpu].mmap_page = perf_add_sample_event_mmap(fd, &manager->events[cpu].mmap_size);
         if (!manager->events[cpu].mmap_page) {
             fprintf(stderr, "Error mapping perf buffer for CPU %d\n", cpu);
@@ -240,13 +251,9 @@ struct perf_event_manager* perf_event_init_with_config(const struct profiling_co
             return NULL;
         }
         manager->events[cpu].pagesize = pagesize;
-
         manager->events[cpu].mmap_buffer = perf_get_mmap_buf(manager->events[cpu].mmap_page, pagesize);
 
-        // 设置非阻塞模式
         fcntl(fd, F_SETFL, O_NONBLOCK);
-
-        // 启用事件
         ioctl(fd, PERF_EVENT_IOC_RESET, 0);
         ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
     }
@@ -313,8 +320,13 @@ int perf_event_consume_ring_buffer(struct perf_event_fd *event,
     size_t buf_size = event->mmap_size - pagesize;  // 实际数据缓冲区大小
 
     // 原子读取生产者/消费者指针
-    uint64_t tail = atomic_load(&event->mmap_page->data_tail);
-    uint64_t head = atomic_load(&event->mmap_page->data_head);
+    uint64_t tail = atomic_load((_Atomic uint64_t*)&event->mmap_page->data_tail);
+    uint64_t head = atomic_load((_Atomic uint64_t*)&event->mmap_page->data_head);
+
+    if (global_config.verbose) {
+        fprintf(stderr, "[DEBUG] perf_event_consume_ring_buffer: Initial head=%llu, tail=%llu\n",
+                (unsigned long long)head, (unsigned long long)tail);
+    }
 
     if (tail == head) {
         return 0; // 无新数据，立即返回
@@ -328,10 +340,17 @@ int perf_event_consume_ring_buffer(struct perf_event_fd *event,
 
     // 临时缓冲区用于处理跨边界数据
     char temp_buf[4096];
+    char *event_data_buf = NULL;
+    bool allocated_temp_buf = false;
 
     // 主循环：处理所有可用事件
     while (cur != end) {
         struct perf_event_header *hdr = NULL;
+        allocated_temp_buf = false; // Reset for each event
+
+        if (global_config.verbose) {
+            fprintf(stderr, "[DEBUG] perf_event_consume_ring_buffer: Loop start, cur=%p, end=%p\n", (void*)cur, (void*)end);
+        }
 
         // 检查事件头部是否跨边界
         if (cur + sizeof(struct perf_event_header) > base + buf_size) {
@@ -344,18 +363,45 @@ int perf_event_consume_ring_buffer(struct perf_event_fd *event,
         }
 
         if (hdr->size == 0) {
+            if (global_config.verbose) {
+                fprintf(stderr, "[DEBUG] perf_event_consume_ring_buffer: hdr->size is 0. Breaking loop.\n");
+            }
             break; // 无效事件，终止处理
+        }
+
+        if (global_config.verbose) {
+            fprintf(stderr, "[DEBUG] perf_event_consume_ring_buffer: hdr->size=%u\n", hdr->size);
+        }
+
+        // Sanity check for hdr->size to prevent buffer overflows from corrupted headers
+        if (hdr->size > buf_size) {
+            fprintf(stderr, "[ERROR] Corrupted perf event header detected: hdr->size (%zu) > buf_size (%zu). Skipping event.\n",
+                    (size_t)hdr->size, buf_size);
+            // Advance cur by a minimal amount to avoid getting stuck on the same corrupted header
+            cur += sizeof(struct perf_event_header);
+            if (cur >= base + buf_size) cur = base;
+            continue; // Skip this corrupted event
         }
 
         // 处理事件数据的三种情况
         if (cur + hdr->size > base + buf_size) {
             size_t first_part = base + buf_size - cur;
-            if (hdr->size <= sizeof(temp_buf)) {
+            if (hdr->size > sizeof(temp_buf)) {
+                event_data_buf = (char*)malloc(hdr->size);
+                if (!event_data_buf) {
+                    fprintf(stderr, "Error: Failed to allocate memory for perf event data.\n");
+                    break; // Critical error, stop processing
+                }
+                allocated_temp_buf = true;
+                memcpy(event_data_buf, cur, first_part);
+                memcpy(event_data_buf + first_part, base, hdr->size - first_part);
+                handler((struct perf_event_header *)event_data_buf, context);
+            } else {
                 memcpy(temp_buf, cur, first_part);
                 memcpy(temp_buf + first_part, base, hdr->size - first_part);
                 handler((struct perf_event_header *)temp_buf, context);
-                processed_count++;
             }
+            processed_count++;
             cur = base + (hdr->size - first_part);
         } else {
             handler(hdr, context);
@@ -365,10 +411,19 @@ int perf_event_consume_ring_buffer(struct perf_event_fd *event,
                 cur = base;
             }
         }
+
+        if (allocated_temp_buf) {
+            free(event_data_buf);
+            event_data_buf = NULL;
+        }
+    }
+
+    if (global_config.verbose) {
+        fprintf(stderr, "[DEBUG] perf_event_consume_ring_buffer: Loop end. Processed %d events.\n", processed_count);
     }
 
     // 原子更新tail指针，通知内核已消费到head位置
-    atomic_store(&event->mmap_page->data_tail, head);
+    atomic_store((_Atomic uint64_t*)&event->mmap_page->data_tail, head);
 
     return processed_count;
 }
