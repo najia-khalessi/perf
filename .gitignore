@@ -1,3 +1,22 @@
 GEMINI.md
 *.o
 my_elf_reader
+
+# IDE and local configuration
+.idea/
+.vscode/
+.trae/
+
+# Build artifacts
+http_server
+
+# Data and logs
+data/
+perf.data
+perf.db
+*.db-shm
+*.db-wal
+profiler_output.txt
+
+# Generated files
+kernel_user_flamegraph_fixed.svg
