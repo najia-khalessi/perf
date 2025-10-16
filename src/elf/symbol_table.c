@@ -41,7 +41,7 @@
  * 4. 找到匹配符号时返回符号信息
  * 
  * 复杂度：O(log n)，n为符号数量
- * 典型场景：ELF文件中通常有1000-10000个符号
+ * 典型场景：ELF文件中通常有>rb1000-10000个符号
  */
 struct symbol_info* rb_search_symbol(struct rb_root *root, uint64_t addr) {
     struct rb_node *node = root->rb_node;
@@ -57,8 +57,8 @@ struct symbol_info* rb_search_symbol(struct rb_root *root, uint64_t addr) {
         // 二叉查找：根据地址大小选择子树
         if (addr < sym->symbol_start)
             node = node->rb_left;  // 地址在符号之前，查找左子树
-        else
-            node = node->rb_right; // 地址在符号之后，查找右子树
+         else
+             node = node->rb_right; // 地址在符号之后，查找右子树
     }
     return NULL;  // 未找到匹配符号
 }
