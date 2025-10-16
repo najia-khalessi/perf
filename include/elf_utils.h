@@ -3,17 +3,29 @@
 
 #include "header.h"
 
-// 查找或创建ELF文件对象
-struct elf_file* find_or_create_elf(struct system_context* sys, int pid, const char *filename);
+// This header aggregates all function prototypes needed for symbolization
+// to be shared between live mode (handler.c) and query mode (query.c).
 
-// 减少ELF文件的引用计数。如果引用计数归零，则移除该文件。
-void release_elf(struct elf_file_cache* elf_table, const char* filename);
+// from process.c (align with actual implementations)
+struct process_info* find_process(struct process_hash_table* table, int pid);
+struct process_info* find_new_process(struct process_hash_table* process_table, int pid);
+struct virtual_memory_area* find_vma_from_process(struct process_info* proc, uint64_t addr);
 
-// 清空整个ELF缓存，释放所有相关内存
-void clear_elf_cache(struct elf_file_cache* elf_table);
+// from vma.c
+uint64_t get_relative_address(uint64_t real_addr, struct virtual_memory_area* vma);
 
-//用于将一个数值 n 对齐到4字节边界。
-//对齐到4字节边界是为了确保数据在内存中的存放符合某些硬件平台的对齐要求，从而提高内存访问的效率和正确性。
-#define NOTE_ALIGN(n) (((n) + 3) & -4U)
+// from elf.c
+struct elf_file* find_or_create_elf(struct system_context* sys, int pid, const char* file_path);
+
+// from symbol_table.c
+const char* find_symbol_name_from_elf(struct elf_file* elf, uint64_t relative_addr);
+
+// A top-level symbolization function
+int find_symbol_for_address(struct system_context* sys, int pid, uint64_t addr, struct symbol_info* result);
+
+// Kernel address check
+static inline bool is_kernel_addr(uint64_t addr) {
+    return addr >= 0xffffffff80000000;
+}
 
 #endif // ELF_UTILS_H
