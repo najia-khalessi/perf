@@ -59,6 +59,8 @@ unsigned long long get_process_start_time(int pid) {
     return 0;
 }
 
+
+
 /**
  * @brief 读取/proc/[pid]/下的指定文件内容
  * @param pid 进程ID
@@ -67,7 +69,7 @@ unsigned long long get_process_start_time(int pid) {
  * 
  * 读取/proc文件系统的核心辅助函数。
  * - 动态构建文件路径
- * - 一次性读取文件所有内容
+ * - 动态调整缓冲区大小以读取完整内容
  * - 调用者负责释放返回的字符串内存
  */
 static char* read_proc_file(int pid, const char* file_name) {
@@ -79,13 +81,29 @@ static char* read_proc_file(int pid, const char* file_name) {
         return NULL; // 进程可能已退出
     }
 
-    char* buffer = (char*)malloc(4096); // 通常足够大
+    size_t buffer_size = 1024;
+    char* buffer = (char*)malloc(buffer_size);
     if (!buffer) {
         close(fd);
         return NULL;
     }
 
-    ssize_t bytes_read = read(fd, buffer, 4095);
+    ssize_t bytes_read = 0;
+    ssize_t total_bytes_read = 0;
+    while ((bytes_read = read(fd, buffer + total_bytes_read, buffer_size - total_bytes_read - 1)) > 0) {
+        total_bytes_read += bytes_read;
+        if (total_bytes_read >= buffer_size - 1) {
+            buffer_size *= 2;
+            char* new_buffer = (char*)realloc(buffer, buffer_size);
+            if (!new_buffer) {
+                free(buffer);
+                close(fd);
+                return NULL;
+            }
+            buffer = new_buffer;
+        }
+    }
+
     close(fd);
 
     if (bytes_read <= 0) {
