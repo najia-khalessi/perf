@@ -20,6 +20,9 @@
 #include <gelf.h>
 #include <elf.h>
 
+#include "config.h" // Include config for profiling_config
+#include "buffer.h" // Include buffer for ring_buffer
+
 #define HASHTABLE_SIZE 1024
 
 #include "rbtree.h"
@@ -65,10 +68,11 @@ struct process_hash_table {
 
 // 符号信息结构体 - 表示ELF文件中的符号（函数或变量）
 struct symbol_info {
-    char* symbol_name;        // 符号名称
-    uint64_t symbol_start;    // 符号起始地址
-    uint64_t symbol_size;     // 符号大小（字节为单位）
-    struct rb_node symbol_rb_node; // 红黑树节点，用于符号快速查找
+    char* symbol_name;        // 函数名称，如"malloc", "printf"
+    uint64_t symbol_start;    // 符号起始地址(相对ELF文件)
+    uint64_t symbol_size;     // 符号大小(字节)，用于地址范围验证
+    char* file_path;          // 符号所属的文件路径
+    struct rb_node symbol_rb_node; // 红黑树节点，按地址排序
 };
 
 // ELF符号集合 - 存储一个ELF文件中的所有符号
@@ -80,7 +84,7 @@ struct elf_symbol_collection {
 // ELF文件结构体 - 表示一个ELF可执行文件或库文件
 struct elf_file {
     char* file_path;          // 文件完整路径
-    char* build_id;           // ELF文件的唯一构建ID
+    char* build_id;           // ELF文件的唯一构建ID，避免文件名冲突
     int reference_count;      // 引用计数（用于缓存管理）
     struct elf_symbol_collection* symbols; // ELF文件中的符号集合
     Elf64_Ehdr elf_header;    // ELF文件头
@@ -102,8 +106,8 @@ struct elf_file_cache {
 
 // 系统全局信息 - 管理整个系统的进程和ELF文件
 struct system_context {
-    struct process_hash_table* process_table;  // 进程哈希表
-    struct elf_file_cache* elf_cache;          // ELF文件缓存
+    struct process_hash_table* process_table;  // 进程哈希表，通过PID找进程详细信息
+    struct elf_file_cache* elf_cache;          // ELF文件缓存，缓存已经解析过的ELF信息
     struct rb_root *kernel_symbols;            // 内核符号红黑树
 };
 
@@ -124,7 +128,7 @@ struct sample_data {
 // Function prototypes
 
 // main_loop.c
-void main_loop(struct system_context* system_info, struct perf_event_manager* manager);
+void main_loop(struct system_context* system_info, struct perf_event_manager* manager, volatile sig_atomic_t *stop, struct ring_buffer *buffer, const struct profiling_config* config);
 
 // system.c
 int initialize_system(struct system_context* system_info);
@@ -143,13 +147,16 @@ void remove_process(struct system_context *sys, int pid);
 
 // handler.c
 void parse_sample_data(struct perf_event_header *header, struct callchain_result *result, uint64_t max_ips);
-void symbolize_sample(struct system_context *sys, struct callchain_result *callchain);
+void symbolize_sample(struct system_context *sys, struct callchain_result *callchain, struct ring_buffer *buffer, const struct profiling_config* config);
+// 已移除live模式相关接口，离线火焰图由query模块生成
 
 // symbol_table.c
 struct symbol_info* rb_search_symbol(struct rb_root *root, uint64_t addr);
+// 查找给定相对地址的符号名称
 const char* find_symbol_name_from_elf(struct elf_file* elf, uint64_t relative_address);
 
 // elf.c
+// 查找或创建ELF文件缓存
 struct elf_file* find_or_create_elf(struct system_context* sys_ctx, int pid, const char* filename);
 void release_elf_by_ptr(struct elf_file_cache* elf_cache, struct elf_file* elf_obj);
 void clear_elf_cache(struct elf_file_cache* elf_cache);
