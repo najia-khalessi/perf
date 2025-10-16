@@ -6,10 +6,7 @@
 #include <linux/perf_event.h>
 #include <sys/mman.h>
 #include <stdatomic.h>
-
-// 前向声明
-struct profiling_config;
-struct sample_data;
+#include "config.h" // 包含config.h以获取profiling_config定义
 
 
 /**
